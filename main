@@ -1,0 +1,761 @@
+import os
+import json
+import discord
+from discord.ext import commands
+from discord import app_commands, Button, ButtonStyle, Embed, Interaction
+from discord.ui import View, button
+import asyncio
+from datetime import datetime, timedelta, timezone  # Import timezone
+from dotenv import load_dotenv
+import sqlite3
+import random
+
+# Load environment variables
+load_dotenv()
+TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+
+# Define intents
+intents = discord.Intents.default()
+intents.members = True
+intents.message_content = True
+bot = commands.Bot(command_prefix='/', intents=intents)
+
+# --- Database Setup ---
+db_connection = sqlite3.connect('server_configs.db')
+db_cursor = db_connection.cursor()
+
+db_cursor.execute('''
+    CREATE TABLE IF NOT EXISTS configs (
+        guild_id INTEGER PRIMARY KEY,
+        verified_role INTEGER,
+        unverified_role INTEGER,
+        warn_threshold INTEGER,
+        warn_sanction TEXT,
+        dm_sanction INTEGER,
+        mass_ban_kick_threshold INTEGER,
+        mass_ban_kick_protection INTEGER
+    )
+''')
+
+db_cursor.execute('''
+    CREATE TABLE IF NOT EXISTS mod_actions (
+        guild_id INTEGER,
+        user_id INTEGER,
+        action_type TEXT,
+        timestamp INTEGER,
+        PRIMARY KEY (guild_id, user_id, action_type, timestamp)
+    )
+''')
+
+# Create the warnings table if it doesn't exist
+db_cursor.execute('''
+    CREATE TABLE IF NOT EXISTS warnings (
+        guild_id INTEGER,
+        user_id INTEGER,
+        warn_count INTEGER DEFAULT 0,
+        PRIMARY KEY (guild_id, user_id)
+    )
+''')
+
+db_connection.commit()
+
+# --- Helper Functions ---
+
+def load_config(guild_id):
+    db_cursor.execute("SELECT * FROM configs WHERE guild_id = ?", (guild_id,))
+    config = db_cursor.fetchone()
+    if config:
+        return {
+            "verified_role": config[1],
+            "unverified_role": config[2],
+            "warn_threshold": config[3],
+            "warn_sanction": config[4],
+            "dm_sanction": bool(config[5]),
+            "mass_ban_kick_threshold": config[6],
+            "mass_ban_kick_protection": bool(config[7])
+        }
+    else:
+        return None
+
+def parse_duration(duration_str):
+    duration_str = duration_str.lower()
+    if not duration_str:
+        return None
+
+    total_seconds = 0
+    temp_num = ""
+
+    for char in duration_str:
+        if char.isdigit():
+            temp_num += char
+        elif char in ('s', 'm', 'h', 'd', 'w'):
+            if not temp_num:
+                return None
+            num = int(temp_num)
+            if char == 's':
+                total_seconds += num
+            elif char == 'm':
+                total_seconds += num * 60
+            elif char == 'h':
+                total_seconds += num * 60 * 60
+            elif char == 'd':
+                total_seconds += num * 60 * 60 * 24
+            elif char == 'w':
+                total_seconds += num * 60 * 60 * 24 * 7
+            temp_num = ""
+        else:
+            return None
+
+    if temp_num:
+        return None
+
+    return total_seconds
+
+def record_mod_action(guild_id, user_id, action_type):
+    timestamp = int(datetime.utcnow().timestamp())
+    db_cursor.execute("INSERT OR IGNORE INTO mod_actions (guild_id, user_id, action_type, timestamp) VALUES (?, ?, ?, ?)",
+                      (guild_id, user_id, action_type, timestamp))
+    db_connection.commit()
+
+async def check_mod_actions(guild_id, user_id):
+    config = load_config(guild_id)
+    if not config or not config["mass_ban_kick_protection"]:
+        return
+
+    threshold = config["mass_ban_kick_threshold"]
+    if threshold is None:
+        return
+
+    time_period = 60  # Check actions within the last 60 seconds
+
+    db_cursor.execute("""
+        SELECT COUNT(*) FROM mod_actions
+        WHERE guild_id = ? AND user_id = ? AND action_type IN ('ban', 'kick') AND timestamp >= ?
+    """, (guild_id, user_id, int(datetime.utcnow().timestamp()) - time_period))
+    count = db_cursor.fetchone()[0]
+
+    if count >= threshold:
+        guild = bot.get_guild(guild_id)
+        if guild:
+            member = guild.get_member(user_id)
+            if member:
+                try:
+                    if config["dm_sanction"]:
+                        dm_embed = Embed(
+                            title=f"You've been kicked from {member.guild.name}.",
+                            description="Our security systems have detected an attempt to perform mass bans or kicks on the server. As a result, you have been automatically kicked as a security measure.\n\nIf you believe this was a mistake, please contact the server administrators.",
+                            color=0xFF0000
+                        )
+                        with open("failsafetriggred.png", "rb") as f:
+                            file = discord.File(f, filename="failsafetriggred.png")
+                            dm_embed.set_image(url="attachment://failsafetriggred.png")
+                            await member.send(embed=dm_embed, file=file)
+
+                    await member.kick(reason="Mass ban/kick detected (automated security measure)")
+                    await send_log(f"**{member}** has been automatically kicked for exceeding the ban/kick limit within a short time (possible mass ban/kick attempt).")
+                except Exception as e:
+                    print(f"Error during kick enforcement: {e}")
+
+async def send_log(message):
+    log_channel_id = 1259938106036195429  # Replace with your log channel ID
+    log_channel = bot.get_channel(log_channel_id)
+    if log_channel:
+        await log_channel.send(embed=discord.Embed(
+            title="Moderation Log",
+            description=message,
+            color=0xda1657
+        ))
+
+async def send_sanction_notification(user, sanction_type, reason, duration=None):
+    config = load_config(user.guild.id)
+    if config and config.get("dm_sanction"):
+        try:
+            if sanction_type == "warn":
+                banner_file = "warningbanner.png"
+                embed = discord.Embed(
+                    title="Warning Notification",
+                    description=f"You have been warned in **{user.guild.name}**.\nReason: **{reason}**",
+                    color=0xe74c3c
+                )
+
+            else:  # Kick, timeout, ban
+                banner_file = "sncbanner.png"
+                if sanction_type == "kick":
+                    embed = discord.Embed(
+                        title="Kick Notification",
+                        description=f"You have been kicked from **{user.guild.name}**.\nReason: **{reason}**",
+                        color=0xda1657
+                    )
+                elif sanction_type == "timeout":
+                    if duration is not None:
+                        duration_str = f"{duration} seconds"  # Format duration
+                        until = discord.utils.utcnow() + timedelta(seconds=duration)
+                        until_str = until.strftime("%Y-%m-%d %H:%M:%S UTC")  # Format time
+                    else:
+                        duration_str = "an unspecified duration"
+                        until_str = "an unspecified time"
+                    embed = discord.Embed(
+                        title="Timeout Notification",
+                        description=f"You have been timed out in **{user.guild.name}** for **{duration_str}** (until {until_str}).\nReason: **{reason}**",
+                        color=0xda1657
+                    )
+
+                elif sanction_type == "ban":
+                    embed = discord.Embed(
+                        title="Ban Notification",
+                        description=f"You have been banned from **{user.guild.name}**.\nReason: **{reason}**",
+                        color=0xda1657
+                    )
+
+            with open(banner_file, "rb") as f:
+                file = discord.File(f, filename=banner_file)
+                embed.set_image(url=f"attachment://{banner_file}")
+                await user.send(embed=embed, file=file)
+        except Exception as e:
+            print(f"Failed to send sanction notification to {user}: {e}")
+
+# --- Bot Events ---
+
+@bot.event
+async def on_member_join(member):
+    config = load_config(member.guild.id)
+    if config and config.get("unverified_role"):
+        try:
+            unverified_role = member.guild.get_role(config["unverified_role"])
+            if unverified_role:
+                await member.add_roles(unverified_role)
+                print(f"Added unverified role to {member.name} in {member.guild.name}")
+            else:
+                print(f"Unverified role not found for guild {member.guild.name}")
+        except Exception as e:
+            print(f"Error adding unverified role: {e}")
+
+@bot.event
+async def on_ready():
+    print('Bot is starting up...')
+    print(f'Logged in as {bot.user}')
+
+    # Add missing columns to the configs table if they don't exist
+    db_cursor.execute("PRAGMA table_info(configs)")
+    existing_columns = [column[1] for column in db_cursor.fetchall()]
+
+    if "mass_ban_kick_threshold" not in existing_columns:
+        db_cursor.execute("ALTER TABLE configs ADD COLUMN mass_ban_kick_threshold INTEGER")
+        print("Added mass_ban_kick_threshold column to configs table")
+
+    if "mass_ban_kick_protection" not in existing_columns:
+        db_cursor.execute("ALTER TABLE configs ADD COLUMN mass_ban_kick_protection INTEGER")
+        print("Added mass_ban_kick_protection column to configs table")
+
+    db_connection.commit()
+
+    # Add persistent view in on_ready event
+    bot.add_view(VerifyView())
+
+    await bot.tree.sync()
+    await bot.change_presence(status=discord.Status.dnd)
+    for cmd in bot.tree.walk_commands():
+        print(f"Registered command: {cmd.name}")
+    print('Bot is ready and commands are synced!')
+
+@bot.event
+async def on_member_ban(guild, user):
+    async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.ban):
+        if entry.target.id == user.id:
+            record_mod_action(guild.id, entry.user.id, "ban")
+            await check_mod_actions(guild.id, entry.user.id)
+
+@bot.event
+async def on_member_remove(member):
+    if not isinstance(member, discord.Member):
+        return
+
+    guild = member.guild
+
+    async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.kick):
+        if entry.target.id == member.id:
+            record_mod_action(guild.id, entry.user.id, "kick")
+            await check_mod_actions(guild.id, entry.user.id)
+
+# --- Bot Commands ---
+# Persistent View Class
+class VerifyView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(VerifyButton())
+
+# Button Class
+class VerifyButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Verify", style=ButtonStyle.green, custom_id="verify_button")
+
+    async def callback(self, interaction: Interaction):
+        if interaction.response.is_done():
+            return
+
+        await interaction.response.defer()
+
+        # --- Get roles from config ---
+        config = load_config(interaction.guild.id)
+        verified_role_id = config.get("verified_role")
+        unverified_role_id = config.get("unverified_role")
+
+        verified_role = interaction.guild.get_role(verified_role_id)
+        unverified_role = interaction.guild.get_role(unverified_role_id)
+
+        if not verified_role or not unverified_role:
+            error_embed = discord.Embed(
+                title="⚠️ - Error",
+                description="Verified or unverified role not configured properly. Contact server owner.",
+                color=0xe74c3c
+            )
+            await interaction.followup.send(embed=error_embed, ephemeral=True)
+            return
+
+        # --- Check if user already has verified role ---
+        if verified_role in interaction.user.roles:
+            already_verified_embed = discord.Embed(
+                title="✅ - Already Verified",
+                description="You are already verified on this server.",
+                color=0x1abc9c
+            )
+            await interaction.followup.send(embed=already_verified_embed, ephemeral=True)
+            return
+
+        # --- Send verification DM ---
+        embed = discord.Embed(
+            title="📧 - Check Your DMs",
+            description="A message has been sent to your DMs to complete the verification.",
+            color=0x1abc9c
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+        user = interaction.user
+        try:
+            dm_channel = await user.create_dm()
+        except Exception as e:
+            error_embed = discord.Embed(
+                title="⚠️ - Error",
+                description=f"Failed to create a DM channel with {user.mention}: {e}",
+                color=0xe74c3c
+            )
+            await interaction.followup.send(embed=error_embed, ephemeral=True)
+            return
+
+        try:
+            num_squares = random.randint(1, 3)
+            verification_images = {
+                1: "verification1sq.png",
+                2: "verification2sq.png",
+                3: "verification3sq.png"
+            }
+            question_image = verification_images[num_squares]
+
+            dm_embed = discord.Embed(
+                title="🔒 - Verification Required",
+                description="Please count the number of green squares and reply with the correct number to verify.",
+                color=0x1abc9c
+            )
+            dm_embed.set_thumbnail(url="https://example.com/verify_icon.png")
+            dm_embed.set_footer(text=f"Nypher | {interaction.guild.name}", icon_url="https://example.com/footer_icon.png")
+
+            with open(question_image, "rb") as file:
+                banner = discord.File(file, filename=question_image)
+                dm_embed.set_image(url=f"attachment://{question_image}")
+                await dm_channel.send(embed=dm_embed, file=banner)
+
+            def check(msg):
+                return msg.author == user and msg.channel == dm_channel
+
+            attempts = 0
+            while attempts < 5:
+                try:
+                    response = await bot.wait_for('message', check=check, timeout=60.0)
+                    if response.content == str(num_squares):
+                        # --- Verification successful, add/remove roles ---
+                        try:
+                            if unverified_role in user.roles:
+                                await user.remove_roles(unverified_role, reason="User verified")
+                            await user.add_roles(verified_role, reason="User verified")
+                        except Exception as e:
+                            print(f"Error adding/removing roles: {e}")
+
+                        with open("verifysuccess.png", "rb") as file:
+                            success_banner = discord.File(file, filename="verifysuccess.png")
+                            verified_embed = discord.Embed(
+                                title="✅ - Verified",
+                                description="You have been successfully verified! 🎉",
+                                color=0x1abc9c
+                            )
+                            verified_embed.set_thumbnail(url="https://example.com/success_icon.png")
+                            verified_embed.set_footer(text=f"Nypher | {interaction.guild.name}", icon_url="https://example.com/footer_icon.png")
+                            verified_embed.set_image(url="attachment://verifysuccess.png")
+                            await dm_channel.send(embed=verified_embed, file=success_banner)
+                        return
+                    else:
+                        attempts += 1
+                        failed_embed = discord.Embed(
+                            title="❌ - Verification Failed",
+                            description=f"Incorrect. You have {5 - attempts} attempts left.",
+                            color=0xe74c3c
+                        )
+                        await dm_channel.send(embed=failed_embed)
+                except asyncio.TimeoutError:
+                    timeout_embed = discord.Embed(
+                        title="⏰ - Timeout",
+                        description="Verification timed out. Please try again.",
+                        color=0xe74c3c
+                    )
+                    await dm_channel.send(embed=timeout_embed)
+                    return
+
+            timeout_embed = discord.Embed(
+                title="⏰ - Verification Failed",
+                description="You have exhausted all attempts. Please start the verification process again.",
+                color=0xe74c3c
+            )
+            await dm_channel.send(embed=timeout_embed)
+
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            error_embed = discord.Embed(
+                title="⚠️ - Error",
+                description=f"An unexpected error occurred: {e}",
+                color=0xe74c3c
+            )
+            await interaction.followup.send(embed=error_embed, ephemeral=True)
+
+# Command Cog
+class VerifySetupCommand(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    @app_commands.command(name="verifysetup", description="Setup the verification process for new members")
+    @app_commands.describe(channel="Select the channel to send the verification message")
+    @commands.is_owner()
+    async def verifysetup(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        await interaction.response.defer()
+        try:
+            verify_embed = discord.Embed(
+                title="🔒 - Verify Your Account",
+                description="This server requires you to **verify to continue**. To do so, press the **button** below.",
+                color=0x1abc9c
+            )
+            verify_embed.set_thumbnail(url="https://example.com/verify_icon.png")
+            verify_embed.set_footer(text=f"Nypher | {interaction.guild.name}", icon_url="https://example.com/footer_icon.png")
+            verify_embed.set_image(url="attachment://verifybanner.png")
+
+            view = VerifyView()
+
+            with open("verifybanner.png", "rb") as file:
+                banner = discord.File(file, filename="verifybanner.png")
+
+            await channel.send(embed=verify_embed, view=view, file=banner)
+            success_embed = discord.Embed(
+                title="✅ - Success",
+                description=f"Verification setup complete in {channel.mention}",
+                color=0x1abc9c
+            )
+            await interaction.followup.send(embed=success_embed, ephemeral=True)
+
+        except Exception as e:
+            print(f"An unexpected error occurred in verifysetup: {e}")
+            error_embed = discord.Embed(
+                title="❌ - Error",
+                description=f"An unexpected error occurred: {e}",
+                color=0xe74c3c
+            )
+            await interaction.followup.send(embed=error_embed, ephemeral=True)
+
+# Function to add cog
+async def setup_cog(bot):
+    await bot.add_cog(VerifySetupCommand(bot))
+
+@bot.tree.command(name="ban", description="Ban a user from the server")
+@commands.has_permissions(ban_members=True)
+async def ban(interaction: discord.Interaction, user: discord.Member, reason: str = None, duration: str = None):
+    await interaction.response.defer()
+
+    duration_seconds = parse_duration(duration)
+    config = load_config(interaction.guild.id)
+
+    if config and config.get("dm_sanction"):
+        try:
+            await send_sanction_notification(user, "ban", reason, duration_seconds)
+        except:
+            pass
+
+    await interaction.guild.ban(user, reason=reason)
+    await interaction.followup.send(embed=discord.Embed(
+        title="Success",
+        description=f"**{user}** has been banned.\nReason: **{reason}**",
+        color=0x13d6a2
+    ))
+
+    await send_log(f"**{user}** has been banned by **{interaction.user}**.\nReason: **{reason}**")
+    record_mod_action(interaction.guild.id, interaction.user.id, "ban")
+    await check_mod_actions(interaction.guild.id, interaction.user.id)
+
+    if duration_seconds:
+        await asyncio.sleep(duration_seconds)
+        await interaction.guild.unban(user)
+        await interaction.followup.send(embed=discord.Embed(
+            title="Unban Notification",
+            description=f"**{user}** has been unbanned after **{duration}**.",
+            color=0x13d6a2
+        ))
+        await send_log(f"**{user}** has been unbanned after **{duration}**.")
+
+@bot.tree.command(name="kick", description="Kick a user from the server")
+@commands.has_permissions(kick_members=True)
+async def kick(interaction: discord.Interaction, user: discord.Member, reason: str = None):
+    await interaction.response.defer()
+
+    config = load_config(interaction.guild.id)
+
+    if config and config.get("dm_sanction"):
+        try:
+            await send_sanction_notification(user, "kick", reason)
+        except:
+            pass
+
+    await interaction.guild.kick(user, reason=reason)
+    await interaction.followup.send(embed=discord.Embed(
+        title="Success",
+        description=f"**{user}** has been kicked.\nReason: **{reason}**",
+        color=0x13d6a2
+    ))
+
+    await send_log(f"**{user}** has been kicked by **{interaction.user}**.\nReason: **{reason}**")
+    record_mod_action(interaction.guild.id, interaction.user.id, "kick")
+    await check_mod_actions(interaction.guild.id, interaction.user.id)
+
+@bot.tree.command(name="timeout", description="Timeout a user")
+@commands.has_permissions(moderate_members=True)
+async def timeout(interaction: discord.Interaction, user: discord.Member, duration: str, reason: str = None):
+    await interaction.response.defer()
+
+    duration_seconds = parse_duration(duration)
+    if duration_seconds is None:
+        await interaction.followup.send("Invalid duration format. Use a number followed by 's', 'm', 'h', 'd', or 'w'.")
+        return
+
+    # Use discord.utils.utcnow() for aware datetime
+    until = discord.utils.utcnow() + timedelta(seconds=duration_seconds)
+
+    config = load_config(interaction.guild.id)
+
+    if config and config.get("dm_sanction"):
+        try:
+            await send_sanction_notification(user, "timeout", reason, duration_seconds)
+        except:
+            pass
+
+    try:
+        await user.timeout(until, reason=reason)
+    except Exception as e:
+        await interaction.followup.send(f"Failed to timeout user: {e}")
+        return
+
+    await interaction.followup.send(embed=discord.Embed(
+        title="Success",
+        description=f"**{user}** has been timed out for **{duration}**.\nReason: **{reason}**",
+        color=0x13d6a2
+    ))
+
+    await send_log(f"**{user}** has been timed out by **{interaction.user}** for **{duration}**.\nReason: **{reason}**")
+    
+@bot.tree.command(name="warn", description="Warn a user")
+@commands.has_permissions(kick_members=True)
+async def warn(interaction: discord.Interaction, user: discord.Member, reason: str = None):
+        await interaction.response.defer()
+
+        config = load_config(interaction.guild.id)
+        guild_id = interaction.guild.id
+        user_id = user.id
+
+        # Update warning count
+        db_cursor.execute("INSERT OR IGNORE INTO warnings (guild_id, user_id) VALUES (?, ?)", (guild_id, user_id))
+        db_cursor.execute("UPDATE warnings SET warn_count = warn_count + 1 WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+        db_connection.commit()
+
+        # Get current warning count
+        db_cursor.execute("SELECT warn_count FROM warnings WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+        warn_count = db_cursor.fetchone()[0]
+
+        if config and config.get("dm_sanction"):
+            try:
+                await send_sanction_notification(user, "warn", reason)
+            except:
+                pass
+
+        warn_threshold = config.get("warn_threshold")
+        warn_sanction = config.get("warn_sanction")
+
+        if warn_count >= warn_threshold:
+            if warn_sanction == "kick":
+                await user.kick(reason=f"Reached warning threshold ({warn_threshold} warnings)")
+                await interaction.followup.send(embed=discord.Embed(
+                    title="Sanction Enforced",
+                    description=f"**{user}** has been kicked for reaching the warning threshold ({warn_threshold} warnings).",
+                    color=0x13d6a2
+                ))
+                await send_log(f"**{user}** has been kicked for reaching the warning threshold ({warn_threshold} warnings).")
+                record_mod_action(guild_id, user_id, "kick")
+            elif warn_sanction == "timeout":
+                duration_seconds = 3 * 60 * 60  # Default 3 hours timeout when warning threshold is reached
+                until = discord.utils.utcnow() + timedelta(seconds=duration_seconds)
+                await user.timeout(until, reason=f"Reached warning threshold ({warn_threshold} warnings)")
+                await interaction.followup.send(embed=discord.Embed(
+                    title="Sanction Enforced",
+                    description=f"**{user}** has been timed out for 3 hours for reaching the warning threshold ({warn_threshold} warnings).",
+                    color=0x13d6a2
+                ))
+                await send_log(f"**{user}** has been timed out for 3 hours for reaching the warning threshold ({warn_threshold} warnings).")
+            elif warn_sanction == "ban":
+                await user.ban(reason=f"Reached warning threshold ({warn_threshold} warnings)")
+                await interaction.followup.send(embed=discord.Embed(
+                    title="Sanction Enforced",
+                    description=f"**{user}** has been banned for reaching the warning threshold ({warn_threshold} warnings).",
+                    color=0x13d6a2
+                ))
+                await send_log(f"**{user}** has been banned for reaching the warning threshold ({warn_threshold} warnings).")
+                record_mod_action(guild_id, user_id, "ban")
+
+            # Reset warn count after sanction
+            db_cursor.execute("UPDATE warnings SET warn_count = 0 WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+            db_connection.commit()
+        else:
+            await interaction.followup.send(embed=discord.Embed(
+                title="Success",
+                description=f"**{user}** has been warned ({warn_count}/{warn_threshold}).\nReason: **{reason}**",
+                color=0x13d6a2
+            ))
+            await send_log(f"**{user}** has been warned by **{interaction.user}** ({warn_count}/{warn_threshold}).\nReason: **{reason}**")
+
+
+
+@bot.tree.command(name="setup", description="Setup server-specific configurations")
+@app_commands.describe(
+    verified_role="Select the verified role",
+    unverified_role="Select the unverified role",
+    warn_threshold="Warn threshold limit before sanction",
+    warn_sanction="Select the sanction for warn threshold",
+    dm_sanction="Should the user be DM'd when sanctioned?",
+    mass_ban_kick_threshold="Set the number of kicks/bans that will trigger the failsafe",
+    mass_ban_kick_protection="Enable or disable the mass kick/ban failsafe"
+)
+@commands.is_owner()
+async def setup(interaction: discord.Interaction, verified_role: discord.Role, unverified_role: discord.Role, warn_threshold: int, warn_sanction: str, dm_sanction: bool, mass_ban_kick_threshold: int, mass_ban_kick_protection: bool):
+
+    guild_id = interaction.guild.id
+    db_cursor.execute("REPLACE INTO configs (guild_id, verified_role, unverified_role, warn_threshold, warn_sanction, dm_sanction, mass_ban_kick_threshold, mass_ban_kick_protection) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                      (guild_id, verified_role.id, unverified_role.id, warn_threshold, warn_sanction, int(dm_sanction), mass_ban_kick_threshold, int(mass_ban_kick_protection)))
+    db_connection.commit()
+
+    await interaction.response.send_message(embed=discord.Embed(
+        title="Setup Complete",
+        description="Server-specific configurations have been saved.",
+        color=0x13d6a2
+    ), ephemeral=True)
+
+
+
+@bot.tree.command(name="help", description="Show a list of commands and detailed instructions")
+async def help(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    config = load_config(guild_id)
+
+    help_embed = discord.Embed(
+        title="Nypher Bot - Help & Instructions",
+        description="Here's a comprehensive guide on how to use Nypher Bot:",
+        color=0x13d6a2
+    )
+
+    # Verification Setup
+    help_embed.add_field(
+        name="`/verifysetup` - Configure the Verification System",
+        value="""
+        Sets up the server's verification process for new members. **(Owner Only)**
+        **Usage:** `/verifysetup [channel]`
+        **Example:** `/verifysetup #verification`
+        **Instructions:**
+        1. Use the command in the channel where you want the verification message to be sent.
+        2. New members will need to click the "Verify" button and complete a simple task in their DMs to get verified.
+        """,
+        inline=False
+    )
+
+    # Moderation Commands
+    help_embed.add_field(
+        name="Moderation Commands: `/ban`, `/kick`, `/timeout`, `/warn`",
+        value="""
+        These commands help you moderate your server.
+        **Usage:**
+        `/ban [user] [reason] [duration]`
+        `/kick [user] [reason]`
+        `/timeout [user] [duration] [reason]`
+        `/warn [user] [reason]`
+        **Examples:**
+        `/ban @User Spamming 7d`
+        `/kick @User Advertising`
+        `/timeout @User Mild Misconduct 1h`
+        `/warn @User Minor Rule Violation`
+        **Duration Format:** `[number][unit]` (e.g., `2s` for 2 seconds, `3h` for 3 hours, `1d` for 1 day, `1w` for 1 week)
+        """,
+        inline=False
+    )
+
+    # Server Setup
+    help_embed.add_field(
+        name="`/setup` - Configure Server Settings",
+        value=f"""
+        Customizes various settings for your server. **(Owner Only)**
+        **Usage:** `/setup [verified_role] [unverified_role] [warn_threshold] [warn_sanction] [dm_sanction] [mass_ban_kick_threshold] [mass_ban_kick_protection]`
+        **Options:**
+        - `verified_role`: The role given to verified members (Current: `{interaction.guild.get_role(config['verified_role']).name if config and config['verified_role'] else 'Not Set'}`)
+        - `unverified_role`: The role for members who haven't verified (Current: `{interaction.guild.get_role(config['unverified_role']).name if config and config['unverified_role'] else 'Not Set'}`)
+        - `warn_threshold`: Number of warns before a sanction is applied (Current: `{config['warn_threshold'] if config and config['warn_threshold'] else 'Not Set'}`)
+        - `warn_sanction`: Action to take after reaching the warn threshold (e.g., kick, timeout) (Current: `{config['warn_sanction'] if config and config['warn_sanction'] else 'Not Set'}`)
+        - `dm_sanction`: Whether to DM users about sanctions (True/False) (Current: `{config['dm_sanction'] if config and config['dm_sanction'] else 'Not Set'}`)
+        - `mass_ban_kick_threshold`: Number of bans/kicks in a short time that will trigger the automatic kick failsafe (Current: `{config['mass_ban_kick_threshold'] if config and config['mass_ban_kick_threshold'] else 'Not Set'}`)
+        - `mass_ban_kick_protection`: Whether to enable the mass kick/ban failsafe (True/False) (Current: `{config['mass_ban_kick_protection'] if config and config['mass_ban_kick_protection'] else 'Not Set'}`)
+        """,
+        inline=False
+    )
+
+    # Additional Notes
+    help_embed.add_field(
+        name="Important Notes",
+        value="""
+        - **Permissions:** Make sure the bot has the necessary permissions (Kick Members, Ban Members, Manage Roles, etc.) in your server.
+        - **Duration:** For commands like `/ban` and `/timeout`, use a valid duration format (e.g., `10s`, `5m`, `1h`, `2d`).
+        - **Mass Ban/Kick Protection:** If enabled in `/setup`, the bot will automatically kick users who perform an excessive number of bans or kicks within a short period.
+        - **Sanction DMs:** If enabled in `/setup`, the bot will send direct messages to users notifying them of sanctions (warnings, kicks, timeouts, bans). It will also notify users if they're kicked by the mass ban/kick failsafe.
+        """,
+        inline=False
+    )
+
+    await interaction.response.send_message(embed=help_embed, ephemeral=True)
+
+
+# --- Run the Bot ---
+async def main():
+    async with bot:
+        await setup_cog(bot)
+
+        # Correct placement of error decorators:
+        @bot.tree.error
+        async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+            if isinstance(error, app_commands.errors.MissingPermissions):
+                await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+            else:
+                print(f"An unhandled error occurred: {error}")
+                try:
+                    await interaction.response.send_message(f"An unexpected error occurred: {error}", ephemeral=True)
+                except discord.errors.InteractionResponded:
+                    await interaction.followup.send(f"An unexpected error occurred: {error}", ephemeral=True)
+        await bot.start(TOKEN)
+
+if __name__ == "__main__":
+    asyncio.run(main())
