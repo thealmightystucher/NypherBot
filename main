@@ -1,7 +1,7 @@
 import os
 import json
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands, Button, ButtonStyle, Embed, Interaction
 from discord.ui import View, button
 import asyncio
@@ -245,6 +245,20 @@ async def on_member_join(member):
         except Exception as e:
             logger.error(f"Error adding unverified role: {e}")
 
+# --- Keep-Alive Task ---
+@tasks.loop(minutes=5)
+async def keep_alive():
+    log_channel_id = 1259938106036195429
+    channel = bot.get_channel(log_channel_id) 
+    if channel:
+        await channel.send("Bot is still alive! ❤️")
+
+# --- Reconnect Logic ---
+@bot.event
+async def on_disconnect():
+    logger.warning("Bot disconnected. Attempting to reconnect...")
+    await bot.connect()
+
 @bot.event
 async def on_ready():
     logger.info('Bot is starting up...')
@@ -266,6 +280,8 @@ async def on_ready():
 
     # Add persistent view in on_ready event
     bot.add_view(VerifyView())
+    
+    keep_alive.start()
 
     await bot.tree.sync()
     await bot.change_presence(status=discord.Status.dnd)
@@ -719,7 +735,7 @@ async def help(interaction: discord.Interaction):
     )
  # Moderation Commands
     help_embed.add_field(
-        name="Moderation Commands: `/ban`, `/kick`, `/timeout`, `/warn`",
+       name="Moderation Commands: `/ban`, `/kick`, `/timeout`, `/warn`",
         value="""
         These commands help you moderate your server.
         **Usage:**
