@@ -15,11 +15,6 @@ import logging
 logger = logging.getLogger('discord')
 logger.setLevel(logging.WARNING)
 
-# File handler to save logs to a file
-file_handler = logging.FileHandler(filename='discord.log', encoding='utf-8', mode='w')
-file_handler.setFormatter(logging.Formatter('%(asctime)s:%(levelname)s:%(name)s: %(message)s'))
-logger.addHandler(file_handler)
-
 # Console handler to print logs to the console
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(logging.Formatter('%(asctime)s:%(levelname)s:%(name)s: %(message)s'))
