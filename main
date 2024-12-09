@@ -245,13 +245,27 @@ async def on_member_join(member):
         except Exception as e:
             logger.error(f"Error adding unverified role: {e}")
 
-# --- Keep-Alive Task ---
-@tasks.loop(minutes=5)
+@tasks.loop(minutes=30)
 async def keep_alive():
-    log_channel_id = 1259938106036195429
-    channel = bot.get_channel(log_channel_id) 
+    log_channel_id = 1259938106036195429  # Replace with your log channel ID
+    channel = bot.get_channel(log_channel_id)
     if channel:
-        await channel.send("Bot is still alive! ❤️")
+        cpu_percent = psutil.cpu_percent(interval=1)
+        ram = psutil.virtual_memory()
+        ram_percent = ram.percent
+        ram_used = ram.used / (1024**3)  # Convert to GB
+        ram_total = ram.total / (1024**3)  # Convert to GB
+
+        embed = discord.Embed(
+            title="📊 Bot Status",
+            description="Status update",
+            color=0x3498db
+        )
+        embed.add_field(name="CPU Usage", value=f"{cpu_percent}%", inline=False)
+        embed.add_field(name="RAM Usage", value=f"{ram_used:.2f} GB / {ram_total:.2f} GB ({ram_percent}%)", inline=False)
+        embed.set_footer(text=f"Nypher | {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+
+        await channel.send(embed=embed)
 
 # --- Reconnect Logic ---
 @bot.event
