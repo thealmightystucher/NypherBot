@@ -9,6 +9,21 @@ from datetime import datetime, timedelta, timezone  # Import timezone
 from dotenv import load_dotenv
 import sqlite3
 import random
+import logging
+
+# --- Logging Setup ---
+logger = logging.getLogger('discord')
+logger.setLevel(logging.DEBUG)  # Set to DEBUG for detailed logs
+
+# File handler to save logs to a file
+file_handler = logging.FileHandler(filename='discord.log', encoding='utf-8', mode='w')
+file_handler.setFormatter(logging.Formatter('%(asctime)s:%(levelname)s:%(name)s: %(message)s'))
+logger.addHandler(file_handler)
+
+# Console handler to print logs to the console
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter('%(asctime)s:%(levelname)s:%(name)s: %(message)s'))
+logger.addHandler(console_handler)
 
 # Load environment variables
 load_dotenv()
@@ -154,7 +169,7 @@ async def check_mod_actions(guild_id, user_id):
                     await member.kick(reason="Mass ban/kick detected (automated security measure)")
                     await send_log(f"**{member}** has been automatically kicked for exceeding the ban/kick limit within a short time (possible mass ban/kick attempt).")
                 except Exception as e:
-                    print(f"Error during kick enforcement: {e}")
+                    logger.error(f"Error during kick enforcement: {e}")
 
 async def send_log(message):
     log_channel_id = 1259938106036195429  # Replace with your log channel ID
@@ -212,7 +227,7 @@ async def send_sanction_notification(user, sanction_type, reason, duration=None)
                 embed.set_image(url=f"attachment://{banner_file}")
                 await user.send(embed=embed, file=file)
         except Exception as e:
-            print(f"Failed to send sanction notification to {user}: {e}")
+            logger.error(f"Failed to send sanction notification to {user}: {e}")
 
 # --- Bot Events ---
 
@@ -224,16 +239,16 @@ async def on_member_join(member):
             unverified_role = member.guild.get_role(config["unverified_role"])
             if unverified_role:
                 await member.add_roles(unverified_role)
-                print(f"Added unverified role to {member.name} in {member.guild.name}")
+                logger.info(f"Added unverified role to {member.name} in {member.guild.name}")
             else:
-                print(f"Unverified role not found for guild {member.guild.name}")
+                logger.warning(f"Unverified role not found for guild {member.guild.name}")
         except Exception as e:
-            print(f"Error adding unverified role: {e}")
+            logger.error(f"Error adding unverified role: {e}")
 
 @bot.event
 async def on_ready():
-    print('Bot is starting up...')
-    print(f'Logged in as {bot.user}')
+    logger.info('Bot is starting up...')
+    logger.info(f'Logged in as {bot.user}')
 
     # Add missing columns to the configs table if they don't exist
     db_cursor.execute("PRAGMA table_info(configs)")
@@ -241,11 +256,11 @@ async def on_ready():
 
     if "mass_ban_kick_threshold" not in existing_columns:
         db_cursor.execute("ALTER TABLE configs ADD COLUMN mass_ban_kick_threshold INTEGER")
-        print("Added mass_ban_kick_threshold column to configs table")
+        logger.info("Added mass_ban_kick_threshold column to configs table")
 
     if "mass_ban_kick_protection" not in existing_columns:
         db_cursor.execute("ALTER TABLE configs ADD COLUMN mass_ban_kick_protection INTEGER")
-        print("Added mass_ban_kick_protection column to configs table")
+        logger.info("Added mass_ban_kick_protection column to configs table")
 
     db_connection.commit()
 
@@ -255,8 +270,8 @@ async def on_ready():
     await bot.tree.sync()
     await bot.change_presence(status=discord.Status.dnd)
     for cmd in bot.tree.walk_commands():
-        print(f"Registered command: {cmd.name}")
-    print('Bot is ready and commands are synced!')
+        logger.info(f"Registered command: {cmd.name}")
+    logger.info('Bot is ready and commands are synced!')
 
 @bot.event
 async def on_member_ban(guild, user):
@@ -290,13 +305,17 @@ class VerifyButton(discord.ui.Button):
         super().__init__(label="Verify", style=ButtonStyle.green, custom_id="verify_button")
 
     async def callback(self, interaction: Interaction):
+        logger.info(f"Verify button pressed by {interaction.user} in {interaction.guild.name}")
         if interaction.response.is_done():
+            logger.warning("Interaction response is already done.")
             return
 
         await interaction.response.defer()
 
         # --- Get roles from config ---
         config = load_config(interaction.guild.id)
+        logger.debug(f"Loaded config: {config}")
+
         verified_role_id = config.get("verified_role")
         unverified_role_id = config.get("unverified_role")
 
@@ -304,6 +323,7 @@ class VerifyButton(discord.ui.Button):
         unverified_role = interaction.guild.get_role(unverified_role_id)
 
         if not verified_role or not unverified_role:
+            logger.error(f"Verified or unverified role not configured properly in {interaction.guild.name}")
             error_embed = discord.Embed(
                 title="⚠️ - Error",
                 description="Verified or unverified role not configured properly. Contact server owner.",
@@ -314,6 +334,7 @@ class VerifyButton(discord.ui.Button):
 
         # --- Check if user already has verified role ---
         if verified_role in interaction.user.roles:
+            logger.info(f"{interaction.user} is already verified in {interaction.guild.name}")
             already_verified_embed = discord.Embed(
                 title="✅ - Already Verified",
                 description="You are already verified on this server.",
@@ -323,6 +344,7 @@ class VerifyButton(discord.ui.Button):
             return
 
         # --- Send verification DM ---
+        logger.info(f"Sending verification DM to {interaction.user}")
         embed = discord.Embed(
             title="📧 - Check Your DMs",
             description="A message has been sent to your DMs to complete the verification.",
@@ -333,7 +355,9 @@ class VerifyButton(discord.ui.Button):
         user = interaction.user
         try:
             dm_channel = await user.create_dm()
+            logger.info(f"DM channel created with {user}")
         except Exception as e:
+            logger.error(f"Failed to create a DM channel with {user}: {e}")
             error_embed = discord.Embed(
                 title="⚠️ - Error",
                 description=f"Failed to create a DM channel with {user.mention}: {e}",
@@ -363,22 +387,27 @@ class VerifyButton(discord.ui.Button):
                 banner = discord.File(file, filename=question_image)
                 dm_embed.set_image(url=f"attachment://{question_image}")
                 await dm_channel.send(embed=dm_embed, file=banner)
+                logger.info(f"Verification question sent to {user}")
 
             def check(msg):
                 return msg.author == user and msg.channel == dm_channel
 
             attempts = 0
             while attempts < 5:
+                logger.info(f"Waiting for verification response from {user}, attempt {attempts + 1}")
                 try:
                     response = await bot.wait_for('message', check=check, timeout=60.0)
+                    logger.debug(f"Received response: {response.content} from {user}")
                     if response.content == str(num_squares):
                         # --- Verification successful, add/remove roles ---
+                        logger.info(f"Verification successful for {user}")
                         try:
                             if unverified_role in user.roles:
                                 await user.remove_roles(unverified_role, reason="User verified")
                             await user.add_roles(verified_role, reason="User verified")
+                            logger.info(f"Roles updated for {user}")
                         except Exception as e:
-                            print(f"Error adding/removing roles: {e}")
+                            logger.error(f"Error adding/removing roles for {user}: {e}")
 
                         with open("verifysuccess.png", "rb") as file:
                             success_banner = discord.File(file, filename="verifysuccess.png")
@@ -394,6 +423,7 @@ class VerifyButton(discord.ui.Button):
                         return
                     else:
                         attempts += 1
+                        logger.info(f"Incorrect verification response from {user}, {5 - attempts} attempts left")
                         failed_embed = discord.Embed(
                             title="❌ - Verification Failed",
                             description=f"Incorrect. You have {5 - attempts} attempts left.",
@@ -401,6 +431,7 @@ class VerifyButton(discord.ui.Button):
                         )
                         await dm_channel.send(embed=failed_embed)
                 except asyncio.TimeoutError:
+                    logger.warning(f"Verification timed out for {user}")
                     timeout_embed = discord.Embed(
                         title="⏰ - Timeout",
                         description="Verification timed out. Please try again.",
@@ -409,6 +440,7 @@ class VerifyButton(discord.ui.Button):
                     await dm_channel.send(embed=timeout_embed)
                     return
 
+            logger.warning(f"{user} exhausted all verification attempts")
             timeout_embed = discord.Embed(
                 title="⏰ - Verification Failed",
                 description="You have exhausted all attempts. Please start the verification process again.",
@@ -417,7 +449,7 @@ class VerifyButton(discord.ui.Button):
             await dm_channel.send(embed=timeout_embed)
 
         except Exception as e:
-            print(f"Unexpected error: {e}")
+            logger.exception(f"Unexpected error during verification process for {user}: {e}")
             error_embed = discord.Embed(
                 title="⚠️ - Error",
                 description=f"An unexpected error occurred: {e}",
@@ -459,7 +491,7 @@ class VerifySetupCommand(commands.Cog):
             await interaction.followup.send(embed=success_embed, ephemeral=True)
 
         except Exception as e:
-            print(f"An unexpected error occurred in verifysetup: {e}")
+            logger.error(f"An unexpected error occurred in verifysetup: {e}")
             error_embed = discord.Embed(
                 title="❌ - Error",
                 description=f"An unexpected error occurred: {e}",
@@ -685,8 +717,7 @@ async def help(interaction: discord.Interaction):
         """,
         inline=False
     )
-
-    # Moderation Commands
+ # Moderation Commands
     help_embed.add_field(
         name="Moderation Commands: `/ban`, `/kick`, `/timeout`, `/warn`",
         value="""
@@ -738,7 +769,6 @@ async def help(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=help_embed, ephemeral=True)
 
-
 # --- Run the Bot ---
 async def main():
     async with bot:
@@ -750,7 +780,7 @@ async def main():
             if isinstance(error, app_commands.errors.MissingPermissions):
                 await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
             else:
-                print(f"An unhandled error occurred: {error}")
+                logger.error(f"An unhandled error occurred: {error}")
                 try:
                     await interaction.response.send_message(f"An unexpected error occurred: {error}", ephemeral=True)
                 except discord.errors.InteractionResponded:
