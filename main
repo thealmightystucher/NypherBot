@@ -10,15 +10,26 @@ from dotenv import load_dotenv
 import sqlite3
 import random
 import logging
+import psutil
+import time
 
 # --- Logging Setup ---
 logger = logging.getLogger('discord')
-logger.setLevel(logging.WARNING)
+logger.setLevel(logging.DEBUG)  # Keep the logger level at DEBUG for detailed file logs
 
-# Console handler to print logs to the console
+# File handler (keep detailed logging)
+file_handler = logging.FileHandler(filename='discord.log', encoding='utf-8', mode='w')
+file_handler.setFormatter(logging.Formatter('%(asctime)s:%(levelname)s:%(name)s: %(message)s'))
+logger.addHandler(file_handler)
+
+# Console handler (reduce logging level)
 console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.WARNING)  # Set console logging to WARNING or higher
 console_handler.setFormatter(logging.Formatter('%(asctime)s:%(levelname)s:%(name)s: %(message)s'))
 logger.addHandler(console_handler)
+
+# Silence discord.gateway debug messages
+logging.getLogger('discord.gateway').setLevel(logging.INFO)
 
 # Load environment variables
 load_dotenv()
@@ -240,33 +251,54 @@ async def on_member_join(member):
         except Exception as e:
             logger.error(f"Error adding unverified role: {e}")
 
-@tasks.loop(minutes=30)
+# --- Keep-Alive Task (Combined Approach) ---
+_start_time = time.time()
+_error_count = 0
+
+@tasks.loop(minutes=5)
 async def keep_alive():
+    global _error_count
     log_channel_id = 1259938106036195429  # Replace with your log channel ID
     channel = bot.get_channel(log_channel_id)
     if channel:
         cpu_percent = psutil.cpu_percent(interval=1)
         ram = psutil.virtual_memory()
         ram_percent = ram.percent
-        ram_used = ram.used / (1024**3)  # Convert to GB
-        ram_total = ram.total / (1024**3)  # Convert to GB
+        ram_used = ram.used / (1024**3)
+        ram_total = ram.total / (1024**3)
 
+        uptime = time.time() - _start_time
+        uptime_str = str(timedelta(seconds=int(uptime)))
+
+        # Check if bot is in any guilds
+        if not bot.guilds:
+            logger.warning("Bot is not in any guilds. Skipping keep-alive message.")
+            return
+        
         embed = discord.Embed(
-            title="📊 Bot Status",
-            description="Status update",
+            title="🤖 Bot Status",
+            description="Periodic status update.",
             color=0x3498db
         )
+        embed.add_field(name="Uptime", value=uptime_str, inline=False)
+        embed.add_field(name="Guilds", value=str(len(bot.guilds)), inline=True)
+        embed.add_field(name="Users", value=str(len(bot.users)), inline=True)
         embed.add_field(name="CPU Usage", value=f"{cpu_percent}%", inline=False)
         embed.add_field(name="RAM Usage", value=f"{ram_used:.2f} GB / {ram_total:.2f} GB ({ram_percent}%)", inline=False)
+
+        if _error_count > 0:
+            embed.add_field(name="Errors since last update", value=str(_error_count), inline=False)
+            embed.color = 0xe74c3c  # Change color to red if errors
+
         embed.set_footer(text=f"Nypher | {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
 
         await channel.send(embed=embed)
+        _error_count = 0
 
 # --- Reconnect Logic ---
 @bot.event
 async def on_disconnect():
     logger.warning("Bot disconnected. Attempting to reconnect...")
-    await bot.connect()
 
 @bot.event
 async def on_ready():
@@ -290,7 +322,8 @@ async def on_ready():
     # Add persistent view in on_ready event
     bot.add_view(VerifyView())
     
-    keep_alive.start()
+    if not keep_alive.is_running():
+        keep_alive.start()
 
     await bot.tree.sync()
     await bot.change_presence(status=discord.Status.dnd)
@@ -418,7 +451,7 @@ class VerifyButton(discord.ui.Button):
                 return msg.author == user and msg.channel == dm_channel
 
             attempts = 0
-            while attempts < 5:
+            while attempts < 1:
                 logger.info(f"Waiting for verification response from {user}, attempt {attempts + 1}")
                 try:
                     response = await bot.wait_for('message', check=check, timeout=60.0)
@@ -448,10 +481,10 @@ class VerifyButton(discord.ui.Button):
                         return
                     else:
                         attempts += 1
-                        logger.info(f"Incorrect verification response from {user}, {5 - attempts} attempts left")
+                        logger.info(f"Incorrect verification response from {user}, {1 - attempts} attempts left")
                         failed_embed = discord.Embed(
                             title="❌ - Verification Failed",
-                            description=f"Incorrect. You have {5 - attempts} attempts left.",
+                            description=f"Incorrect. You have {1 - attempts} attempt left.",
                             color=0xe74c3c
                         )
                         await dm_channel.send(embed=failed_embed)
@@ -489,7 +522,7 @@ class VerifySetupCommand(commands.Cog):
 
     @app_commands.command(name="verifysetup", description="Setup the verification process for new members")
     @app_commands.describe(channel="Select the channel to send the verification message")
-    @commands.is_owner()
+    @commands.has_permissions(administrator=True)
     async def verifysetup(self, interaction: discord.Interaction, channel: discord.TextChannel):
         await interaction.response.defer()
         try:
@@ -702,7 +735,7 @@ async def warn(interaction: discord.Interaction, user: discord.Member, reason: s
     mass_ban_kick_threshold="Set the number of kicks/bans that will trigger the failsafe",
     mass_ban_kick_protection="Enable or disable the mass kick/ban failsafe"
 )
-@commands.is_owner()
+@commands.has_permissions(administrator=True)
 async def setup(interaction: discord.Interaction, verified_role: discord.Role, unverified_role: discord.Role, warn_threshold: int, warn_sanction: str, dm_sanction: bool, mass_ban_kick_threshold: int, mass_ban_kick_protection: bool):
 
     guild_id = interaction.guild.id
@@ -733,7 +766,7 @@ async def help(interaction: discord.Interaction):
     help_embed.add_field(
         name="`/verifysetup` - Configure the Verification System",
         value="""
-        Sets up the server's verification process for new members. **(Owner Only)**
+        Sets up the server's verification process for new members. **(Administrator Only)**
         **Usage:** `/verifysetup [channel]`
         **Example:** `/verifysetup #verification`
         **Instructions:**
@@ -744,7 +777,7 @@ async def help(interaction: discord.Interaction):
     )
  # Moderation Commands
     help_embed.add_field(
-       name="Moderation Commands: `/ban`, `/kick`, `/timeout`, `/warn`",
+        name="Moderation Commands: `/ban`, `/kick`, `/timeout`, `/warn`",
         value="""
         These commands help you moderate your server.
         **Usage:**
@@ -766,7 +799,7 @@ async def help(interaction: discord.Interaction):
     help_embed.add_field(
         name="`/setup` - Configure Server Settings",
         value=f"""
-        Customizes various settings for your server. **(Owner Only)**
+        Customizes various settings for your server. **(Administrator Only)**
         **Usage:** `/setup [verified_role] [unverified_role] [warn_threshold] [warn_sanction] [dm_sanction] [mass_ban_kick_threshold] [mass_ban_kick_protection]`
         **Options:**
         - `verified_role`: The role given to verified members (Current: `{interaction.guild.get_role(config['verified_role']).name if config and config['verified_role'] else 'Not Set'}`)
@@ -794,22 +827,25 @@ async def help(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=help_embed, ephemeral=True)
 
+# --- Error Handling ---
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    global _error_count
+    if isinstance(error, app_commands.errors.MissingPermissions):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+    else:
+        logger.error(f"An unhandled error occurred: {error}")
+        _error_count += 1
+        try:
+            await interaction.response.send_message(f"An unexpected error occurred: {error}", ephemeral=True)
+        except discord.errors.InteractionResponded:
+            await interaction.followup.send(f"An unexpected error occurred: {error}", ephemeral=True)
+
 # --- Run the Bot ---
 async def main():
     async with bot:
         await setup_cog(bot)
-
-        # Correct placement of error decorators:
-        @bot.tree.error
-        async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-            if isinstance(error, app_commands.errors.MissingPermissions):
-                await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
-            else:
-                logger.error(f"An unhandled error occurred: {error}")
-                try:
-                    await interaction.response.send_message(f"An unexpected error occurred: {error}", ephemeral=True)
-                except discord.errors.InteractionResponded:
-                    await interaction.followup.send(f"An unexpected error occurred: {error}", ephemeral=True)
         await bot.start(TOKEN)
 
 if __name__ == "__main__":
